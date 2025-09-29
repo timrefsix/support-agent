@@ -7,32 +7,45 @@ from agents.model_settings import ModelSettings
 from agents.mcp import MCPServerStdio
 
 AGENT_SYS_PROMPT = """
-You are a CouchDB read-only assistant. You may ONLY use the provided CouchDB MCP tools.
-Never write or modify data. When the user asks for data, call the appropriate tool(s) and
-return concise JSON results. If the user asks for something that would require writes,
-explain that you are read-only.
+You are a read-only assistant with access to CouchDB and Stripe MCP tools.
+Use these tools to retrieve data from either source as needed, never attempt writes.
+When responding, return concise JSON results or explanations, and make it clear when
+an action is impossible because you cannot modify data.
 """
 
 async def run(prompt: str, json_only: bool):
     # Connect to the local stdio MCP server
-    server = MCPServerStdio(
+    couchdb_server = MCPServerStdio(
         name="couchdb",
         params={
             "command": "python",
             "args": ["couchdb_mcp_server.py"],
         },
     )
-    srv = await server.__aenter__()
+    stripe_api_key = os.environ["STRIPE_API_KEY"]
+    stripe_server = MCPServerStdio(
+        name="stripe",
+        params={
+            "command": "stripe-mcp",
+            "args": [],
+            "env": {**os.environ, "STRIPE_API_KEY": stripe_api_key},
+        },
+    )
+
+    couch_srv, stripe_srv = await asyncio.gather(
+        couchdb_server.__aenter__(), stripe_server.__aenter__()
+    )
 
     agent = Agent(
         name="CouchDB Reader",
         instructions=AGENT_SYS_PROMPT,
         model=os.getenv("OPENAI_MODEL", "gpt-4.1"),
-        mcp_servers=[srv],
+        mcp_servers=[couch_srv],
         tools=[],  # all tools come from the MCP server
         model_settings=ModelSettings(tool_choice="auto"),  # allow the model to pick tools
         # No structured output here; we let the agent return readable JSON
     )
+    agent.mcp_servers.append(stripe_srv)
 
     result = await Runner.run(agent, prompt, max_turns=8)
 
@@ -42,7 +55,10 @@ async def run(prompt: str, json_only: bool):
     else:
         print("\n--- Agent Output ---\n" + out)
 
-    await server.__aexit__(None, None, None)
+    await asyncio.gather(
+        couchdb_server.__aexit__(None, None, None),
+        stripe_server.__aexit__(None, None, None),
+    )
 
 def main():
     load_dotenv()
